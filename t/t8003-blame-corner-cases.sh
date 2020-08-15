@@ -6,7 +6,6 @@ test_description='git blame corner cases'
 pick_fc='s/^[0-9a-f^]* *\([^ ]*\) *(\([^ ]*\) .*/\1-\2/'
 
 test_expect_success setup '
-
 	echo A A A A A >one &&
 	echo B B B B B >two &&
 	echo C C C C C >tres &&
@@ -173,7 +172,6 @@ test_expect_success 'blame during cherry-pick with file rename conflict' '
 	git show HEAD@{1}:rodent > rodent &&
 	git add rodent &&
 	git blame -f -C -C1 rodent | sed -e "$pick_fc" >current &&
-	cat current &&
 	cat >expected <<-\EOF &&
 	mouse-Initial
 	mouse-Second
@@ -273,6 +271,42 @@ test_expect_success 'blame file with CRLF core.autocrlf=true' '
 	rm tmp &&
 	git blame crlfinrepo >actual &&
 	grep "A U Thor" actual
+'
+
+# Tests the splitting and merging of blame entries in blame_coalesce().
+# The output of blame is the same, regardless of whether blame_coalesce() runs
+# or not, so we'd likely only notice a problem if blame crashes or assigned
+# blame to the "splitting" commit ('SPLIT' below).
+test_expect_success 'blame coalesce' '
+	cat >giraffe <<-\EOF &&
+	ABC
+	DEF
+	EOF
+	git add giraffe &&
+	git commit -m "original file" &&
+	oid=$(git rev-parse HEAD) &&
+
+	cat >giraffe <<-\EOF &&
+	ABC
+	SPLIT
+	DEF
+	EOF
+	git add giraffe &&
+	git commit -m "interior SPLIT line" &&
+
+	cat >giraffe <<-\EOF &&
+	ABC
+	DEF
+	EOF
+	git add giraffe &&
+	git commit -m "same contents as original" &&
+
+	cat >expect <<-EOF &&
+	$oid 1) ABC
+	$oid 2) DEF
+	EOF
+	git -c core.abbrev=$(test_oid hexsz) blame -s giraffe >actual &&
+	test_cmp expect actual
 '
 
 test_done

@@ -10,8 +10,8 @@
 #include "run-command.h"
 #include "log-tree.h"
 #include "bisect.h"
-#include "sha1-array.h"
-#include "argv-array.h"
+#include "oid-array.h"
+#include "strvec.h"
 #include "commit-slab.h"
 #include "commit-reach.h"
 #include "object-store.h"
@@ -456,7 +456,7 @@ static GIT_PATH_FUNC(git_path_bisect_log, "BISECT_LOG")
 static GIT_PATH_FUNC(git_path_bisect_terms, "BISECT_TERMS")
 static GIT_PATH_FUNC(git_path_head_name, "head-name")
 
-static void read_bisect_paths(struct argv_array *array)
+static void read_bisect_paths(struct strvec *array)
 {
 	struct strbuf str = STRBUF_INIT;
 	const char *filename = git_path_bisect_names();
@@ -464,7 +464,7 @@ static void read_bisect_paths(struct argv_array *array)
 
 	while (strbuf_getline_lf(&str, fp) != EOF) {
 		strbuf_trim(&str);
-		if (sq_dequote_to_argv_array(str.buf, array))
+		if (sq_dequote_to_strvec(str.buf, array))
 			die(_("Badly quoted content in file '%s': %s"),
 			    filename, str.buf);
 	}
@@ -473,7 +473,7 @@ static void read_bisect_paths(struct argv_array *array)
 	fclose(fp);
 }
 
-static char *join_sha1_array_hex(struct oid_array *array, char delim)
+static char *join_oid_array_hex(struct oid_array *array, char delim)
 {
 	struct strbuf joined_hexs = STRBUF_INIT;
 	int i;
@@ -558,7 +558,8 @@ struct commit_list *filter_skipped(struct commit_list *list,
  * is increased by one between each call, but that should not matter
  * for this application.
  */
-static unsigned get_prn(unsigned count) {
+static unsigned get_prn(unsigned count)
+{
 	count = count * 1103515245 + 12345;
 	return (count/65536) % PRN_MODULO;
 }
@@ -571,7 +572,7 @@ static int sqrti(int val)
 {
 	float d, x = val;
 
-	if (val == 0)
+	if (!val)
 		return 0;
 
 	do {
@@ -626,28 +627,29 @@ static struct commit_list *managed_skipped(struct commit_list *list,
 	return skip_away(list, count);
 }
 
-static void bisect_rev_setup(struct rev_info *revs, const char *prefix,
+static void bisect_rev_setup(struct repository *r, struct rev_info *revs,
+			     const char *prefix,
 			     const char *bad_format, const char *good_format,
 			     int read_paths)
 {
-	struct argv_array rev_argv = ARGV_ARRAY_INIT;
+	struct strvec rev_argv = STRVEC_INIT;
 	int i;
 
-	repo_init_revisions(the_repository, revs, prefix);
+	repo_init_revisions(r, revs, prefix);
 	revs->abbrev = 0;
 	revs->commit_format = CMIT_FMT_UNSPECIFIED;
 
 	/* rev_argv.argv[0] will be ignored by setup_revisions */
-	argv_array_push(&rev_argv, "bisect_rev_setup");
-	argv_array_pushf(&rev_argv, bad_format, oid_to_hex(current_bad_oid));
+	strvec_push(&rev_argv, "bisect_rev_setup");
+	strvec_pushf(&rev_argv, bad_format, oid_to_hex(current_bad_oid));
 	for (i = 0; i < good_revs.nr; i++)
-		argv_array_pushf(&rev_argv, good_format,
-				 oid_to_hex(good_revs.oid + i));
-	argv_array_push(&rev_argv, "--");
+		strvec_pushf(&rev_argv, good_format,
+			     oid_to_hex(good_revs.oid + i));
+	strvec_push(&rev_argv, "--");
 	if (read_paths)
 		read_bisect_paths(&rev_argv);
 
-	setup_revisions(rev_argv.argc, rev_argv.argv, revs, NULL);
+	setup_revisions(rev_argv.nr, rev_argv.v, revs, NULL);
 	/* XXX leak rev_argv, as "revs" may still be pointing to it */
 }
 
@@ -656,14 +658,14 @@ static void bisect_common(struct rev_info *revs)
 	if (prepare_revision_walk(revs))
 		die("revision walk setup failed");
 	if (revs->tree_objects)
-		mark_edges_uninteresting(revs, NULL);
+		mark_edges_uninteresting(revs, NULL, 0);
 }
 
-static void exit_if_skipped_commits(struct commit_list *tried,
+static enum bisect_error error_if_skipped_commits(struct commit_list *tried,
 				    const struct object_id *bad)
 {
 	if (!tried)
-		return;
+		return BISECT_OK;
 
 	printf("There are only 'skip'ped commits left to test.\n"
 	       "The first %s commit could be any of:\n", term_bad);
@@ -674,7 +676,8 @@ static void exit_if_skipped_commits(struct commit_list *tried,
 	if (bad)
 		printf("%s\n", oid_to_hex(bad));
 	printf(_("We cannot bisect more!\n"));
-	exit(2);
+
+	return BISECT_ONLY_SKIPPED_LEFT;
 }
 
 static int is_expected_rev(const struct object_id *oid)
@@ -701,11 +704,12 @@ static int is_expected_rev(const struct object_id *oid)
 	return res;
 }
 
-static int bisect_checkout(const struct object_id *bisect_rev, int no_checkout)
+static enum bisect_error bisect_checkout(const struct object_id *bisect_rev, int no_checkout)
 {
 	char bisect_rev_hex[GIT_MAX_HEXSZ + 1];
+	enum bisect_error res = BISECT_OK;
 
-	memcpy(bisect_rev_hex, oid_to_hex(bisect_rev), GIT_SHA1_HEXSZ + 1);
+	oid_to_hex_r(bisect_rev_hex, bisect_rev);
 	update_ref(NULL, "BISECT_EXPECTED_REV", bisect_rev, NULL, 0, UPDATE_REFS_DIE_ON_ERR);
 
 	argv_checkout[2] = bisect_rev_hex;
@@ -713,43 +717,55 @@ static int bisect_checkout(const struct object_id *bisect_rev, int no_checkout)
 		update_ref(NULL, "BISECT_HEAD", bisect_rev, NULL, 0,
 			   UPDATE_REFS_DIE_ON_ERR);
 	} else {
-		int res;
 		res = run_command_v_opt(argv_checkout, RUN_GIT_CMD);
 		if (res)
-			exit(res);
+			/*
+			 * Errors in `run_command()` itself, signaled by res < 0,
+			 * and errors in the child process, signaled by res > 0
+			 * can both be treated as regular BISECT_FAILURE (-1).
+			 */
+			return -abs(res);
 	}
 
 	argv_show_branch[1] = bisect_rev_hex;
-	return run_command_v_opt(argv_show_branch, RUN_GIT_CMD);
+	res = run_command_v_opt(argv_show_branch, RUN_GIT_CMD);
+	/*
+	 * Errors in `run_command()` itself, signaled by res < 0,
+	 * and errors in the child process, signaled by res > 0
+	 * can both be treated as regular BISECT_FAILURE (-1).
+	 */
+	return -abs(res);
 }
 
-static struct commit *get_commit_reference(const struct object_id *oid)
+static struct commit *get_commit_reference(struct repository *r,
+					   const struct object_id *oid)
 {
-	struct commit *r = lookup_commit_reference(the_repository, oid);
-	if (!r)
+	struct commit *c = lookup_commit_reference(r, oid);
+	if (!c)
 		die(_("Not a valid commit name %s"), oid_to_hex(oid));
-	return r;
+	return c;
 }
 
-static struct commit **get_bad_and_good_commits(int *rev_nr)
+static struct commit **get_bad_and_good_commits(struct repository *r,
+						int *rev_nr)
 {
 	struct commit **rev;
 	int i, n = 0;
 
 	ALLOC_ARRAY(rev, 1 + good_revs.nr);
-	rev[n++] = get_commit_reference(current_bad_oid);
+	rev[n++] = get_commit_reference(r, current_bad_oid);
 	for (i = 0; i < good_revs.nr; i++)
-		rev[n++] = get_commit_reference(good_revs.oid + i);
+		rev[n++] = get_commit_reference(r, good_revs.oid + i);
 	*rev_nr = n;
 
 	return rev;
 }
 
-static void handle_bad_merge_base(void)
+static enum bisect_error handle_bad_merge_base(void)
 {
 	if (is_expected_rev(current_bad_oid)) {
 		char *bad_hex = oid_to_hex(current_bad_oid);
-		char *good_hex = join_sha1_array_hex(&good_revs, ' ');
+		char *good_hex = join_oid_array_hex(&good_revs, ' ');
 		if (!strcmp(term_bad, "bad") && !strcmp(term_good, "good")) {
 			fprintf(stderr, _("The merge base %s is bad.\n"
 				"This means the bug has been fixed "
@@ -766,21 +782,21 @@ static void handle_bad_merge_base(void)
 				"between %s and [%s].\n"),
 				bad_hex, term_bad, term_good, bad_hex, good_hex);
 		}
-		exit(3);
+		return BISECT_MERGE_BASE_CHECK;
 	}
 
 	fprintf(stderr, _("Some %s revs are not ancestors of the %s rev.\n"
 		"git bisect cannot work properly in this case.\n"
 		"Maybe you mistook %s and %s revs?\n"),
 		term_good, term_bad, term_good, term_bad);
-	exit(1);
+	return BISECT_FAILED;
 }
 
 static void handle_skipped_merge_base(const struct object_id *mb)
 {
 	char *mb_hex = oid_to_hex(mb);
 	char *bad_hex = oid_to_hex(current_bad_oid);
-	char *good_hex = join_sha1_array_hex(&good_revs, ' ');
+	char *good_hex = join_oid_array_hex(&good_revs, ' ');
 
 	warning(_("the merge base between %s and [%s] "
 		"must be skipped.\n"
@@ -795,13 +811,18 @@ static void handle_skipped_merge_base(const struct object_id *mb)
  * "check_merge_bases" checks that merge bases are not "bad" (or "new").
  *
  * - If one is "bad" (or "new"), it means the user assumed something wrong
- * and we must exit with a non 0 error code.
+ * and we must return error with a non 0 error code.
  * - If one is "good" (or "old"), that's good, we have nothing to do.
  * - If one is "skipped", we can't know but we should warn.
  * - If we don't know, we should check it out and ask the user to test.
+ * - If a merge base must be tested, on success return
+ * BISECT_INTERNAL_SUCCESS_MERGE_BASE (-11) a special condition
+ * for early success, this will be converted back to 0 in
+ * check_good_are_ancestors_of_bad().
  */
-static void check_merge_bases(int rev_nr, struct commit **rev, int no_checkout)
+static enum bisect_error check_merge_bases(int rev_nr, struct commit **rev, int no_checkout)
 {
+	enum bisect_error res = BISECT_OK;
 	struct commit_list *result;
 
 	result = get_merge_bases_many(rev[0], rev_nr - 1, rev + 1);
@@ -809,26 +830,33 @@ static void check_merge_bases(int rev_nr, struct commit **rev, int no_checkout)
 	for (; result; result = result->next) {
 		const struct object_id *mb = &result->item->object.oid;
 		if (oideq(mb, current_bad_oid)) {
-			handle_bad_merge_base();
+			res = handle_bad_merge_base();
+			break;
 		} else if (0 <= oid_array_lookup(&good_revs, mb)) {
 			continue;
 		} else if (0 <= oid_array_lookup(&skipped_revs, mb)) {
 			handle_skipped_merge_base(mb);
 		} else {
 			printf(_("Bisecting: a merge base must be tested\n"));
-			exit(bisect_checkout(mb, no_checkout));
+			res = bisect_checkout(mb, no_checkout);
+			if (!res)
+				/* indicate early success */
+				res = BISECT_INTERNAL_SUCCESS_MERGE_BASE;
+			break;
 		}
 	}
 
 	free_commit_list(result);
+	return res;
 }
 
-static int check_ancestors(int rev_nr, struct commit **rev, const char *prefix)
+static int check_ancestors(struct repository *r, int rev_nr,
+			   struct commit **rev, const char *prefix)
 {
 	struct rev_info revs;
 	int res;
 
-	bisect_rev_setup(&revs, prefix, "^%s", "%s", 0);
+	bisect_rev_setup(r, &revs, prefix, "^%s", "%s", 0);
 
 	bisect_common(&revs);
 	res = (revs.commits != NULL);
@@ -845,66 +873,76 @@ static int check_ancestors(int rev_nr, struct commit **rev, const char *prefix)
  *
  * If that's not the case, we need to check the merge bases.
  * If a merge base must be tested by the user, its source code will be
- * checked out to be tested by the user and we will exit.
+ * checked out to be tested by the user and we will return.
  */
-static void check_good_are_ancestors_of_bad(const char *prefix, int no_checkout)
+
+static enum bisect_error check_good_are_ancestors_of_bad(struct repository *r,
+					    const char *prefix,
+					    int no_checkout)
 {
-	char *filename = git_pathdup("BISECT_ANCESTORS_OK");
+	char *filename;
 	struct stat st;
 	int fd, rev_nr;
+	enum bisect_error res = BISECT_OK;
 	struct commit **rev;
 
 	if (!current_bad_oid)
-		die(_("a %s revision is needed"), term_bad);
+		return error(_("a %s revision is needed"), term_bad);
+
+	filename = git_pathdup("BISECT_ANCESTORS_OK");
 
 	/* Check if file BISECT_ANCESTORS_OK exists. */
 	if (!stat(filename, &st) && S_ISREG(st.st_mode))
 		goto done;
 
 	/* Bisecting with no good rev is ok. */
-	if (good_revs.nr == 0)
+	if (!good_revs.nr)
 		goto done;
 
 	/* Check if all good revs are ancestor of the bad rev. */
-	rev = get_bad_and_good_commits(&rev_nr);
-	if (check_ancestors(rev_nr, rev, prefix))
-		check_merge_bases(rev_nr, rev, no_checkout);
+
+	rev = get_bad_and_good_commits(r, &rev_nr);
+	if (check_ancestors(r, rev_nr, rev, prefix))
+		res = check_merge_bases(rev_nr, rev, no_checkout);
 	free(rev);
 
-	/* Create file BISECT_ANCESTORS_OK. */
-	fd = open(filename, O_CREAT | O_TRUNC | O_WRONLY, 0600);
-	if (fd < 0)
-		warning_errno(_("could not create file '%s'"),
-			      filename);
-	else
-		close(fd);
+	if (!res) {
+		/* Create file BISECT_ANCESTORS_OK. */
+		fd = open(filename, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+		if (fd < 0)
+			/*
+			 * BISECT_ANCESTORS_OK file is not absolutely necessary,
+			 * the bisection process will continue at the next
+			 * bisection step.
+			 * So, just signal with a warning that something
+			 * might be wrong.
+			 */
+			warning_errno(_("could not create file '%s'"),
+				filename);
+		else
+			close(fd);
+	}
  done:
 	free(filename);
+	return res;
 }
 
 /*
  * This does "git diff-tree --pretty COMMIT" without one fork+exec.
  */
-static void show_diff_tree(const char *prefix, struct commit *commit)
+static void show_diff_tree(struct repository *r,
+			   const char *prefix,
+			   struct commit *commit)
 {
+	const char *argv[] = {
+		"diff-tree", "--pretty", "--stat", "--summary", "--cc", NULL
+	};
 	struct rev_info opt;
 
-	/* diff-tree init */
-	repo_init_revisions(the_repository, &opt, prefix);
-	git_config(git_diff_basic_config, NULL); /* no "diff" UI options */
-	opt.abbrev = 0;
-	opt.diff = 1;
+	git_config(git_diff_ui_config, NULL);
+	repo_init_revisions(r, &opt, prefix);
 
-	/* This is what "--pretty" does */
-	opt.verbose_header = 1;
-	opt.use_terminator = 0;
-	opt.commit_format = CMIT_FMT_DEFAULT;
-
-	/* diff-tree init */
-	if (!opt.diffopt.output_format)
-		opt.diffopt.output_format = DIFF_FORMAT_RAW;
-
-	setup_revisions(0, NULL, &opt, NULL);
+	setup_revisions(ARRAY_SIZE(argv) - 1, argv, &opt, NULL);
 	log_tree_commit(&opt, commit);
 }
 
@@ -938,18 +976,19 @@ void read_bisect_terms(const char **read_bad, const char **read_good)
 }
 
 /*
- * We use the convention that exiting with an exit code 10 means that
+ * We use the convention that return BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND (-10) means
  * the bisection process finished successfully.
- * In this case the calling shell script should exit 0.
- *
+ * In this case the calling function or command should not turn a
+ * BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND return code into an error or a non zero exit code.
  * If no_checkout is non-zero, the bisection process does not
  * checkout the trial commit but instead simply updates BISECT_HEAD.
  */
-int bisect_next_all(const char *prefix, int no_checkout)
+enum bisect_error bisect_next_all(struct repository *r, const char *prefix, int no_checkout)
 {
 	struct rev_info revs;
 	struct commit_list *tried;
 	int reaches = 0, all = 0, nr, steps;
+	enum bisect_error res = BISECT_OK;
 	struct object_id *bisect_rev;
 	char *steps_msg;
 
@@ -957,9 +996,11 @@ int bisect_next_all(const char *prefix, int no_checkout)
 	if (read_bisect_refs())
 		die(_("reading bisect refs failed"));
 
-	check_good_are_ancestors_of_bad(prefix, no_checkout);
+	res = check_good_are_ancestors_of_bad(r, prefix, no_checkout);
+	if (res)
+		return res;
 
-	bisect_rev_setup(&revs, prefix, "%s", "^%s", 1);
+	bisect_rev_setup(r, &revs, prefix, "%s", "^%s", 1);
 	revs.limited = 1;
 
 	bisect_common(&revs);
@@ -969,33 +1010,45 @@ int bisect_next_all(const char *prefix, int no_checkout)
 
 	if (!revs.commits) {
 		/*
-		 * We should exit here only if the "bad"
+		 * We should return error here only if the "bad"
 		 * commit is also a "skip" commit.
 		 */
-		exit_if_skipped_commits(tried, NULL);
-
+		res = error_if_skipped_commits(tried, NULL);
+		if (res < 0)
+			return res;
 		printf(_("%s was both %s and %s\n"),
 		       oid_to_hex(current_bad_oid),
 		       term_good,
 		       term_bad);
-		exit(1);
+
+		return BISECT_FAILED;
 	}
 
 	if (!all) {
 		fprintf(stderr, _("No testable commit found.\n"
 			"Maybe you started with bad path parameters?\n"));
-		exit(4);
+
+		return BISECT_NO_TESTABLE_COMMIT;
 	}
 
 	bisect_rev = &revs.commits->item->object.oid;
 
 	if (oideq(bisect_rev, current_bad_oid)) {
-		exit_if_skipped_commits(tried, current_bad_oid);
+		res = error_if_skipped_commits(tried, current_bad_oid);
+		if (res)
+			return res;
 		printf("%s is the first %s commit\n", oid_to_hex(bisect_rev),
 			term_bad);
-		show_diff_tree(prefix, revs.commits->item);
-		/* This means the bisection process succeeded. */
-		exit(10);
+
+		show_diff_tree(r, prefix, revs.commits->item);
+		/*
+		 * This means the bisection process succeeded.
+		 * Using BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND (-10)
+		 * so that the call chain can simply check
+		 * for negative return values for early returns up
+		 * until the cmd_bisect__helper() caller.
+		 */
+		return BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND;
 	}
 
 	nr = all - reaches - 1;

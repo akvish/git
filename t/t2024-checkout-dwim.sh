@@ -37,7 +37,9 @@ test_expect_success 'setup' '
 		git checkout -b foo &&
 		test_commit a_foo &&
 		git checkout -b bar &&
-		test_commit a_bar
+		test_commit a_bar &&
+		git checkout -b ambiguous_branch_and_file &&
+		test_commit a_ambiguous_branch_and_file
 	) &&
 	git init repo_b &&
 	(
@@ -46,7 +48,9 @@ test_expect_success 'setup' '
 		git checkout -b foo &&
 		test_commit b_foo &&
 		git checkout -b baz &&
-		test_commit b_baz
+		test_commit b_baz &&
+		git checkout -b ambiguous_branch_and_file &&
+		test_commit b_ambiguous_branch_and_file
 	) &&
 	git remote add repo_a repo_a &&
 	git remote add repo_b repo_b &&
@@ -73,6 +77,26 @@ test_expect_success 'checkout of branch from multiple remotes fails #1' '
 	status_uno_is_clean &&
 	test_must_fail git rev-parse --verify refs/heads/foo &&
 	test_branch master
+'
+
+test_expect_success 'when arg matches multiple remotes, do not fallback to interpreting as pathspec' '
+	# create a file with name matching remote branch name
+	git checkout -b t_ambiguous_branch_and_file &&
+	>ambiguous_branch_and_file &&
+	git add ambiguous_branch_and_file &&
+	git commit -m "ambiguous_branch_and_file" &&
+
+	# modify file to verify that it will not be touched by checkout
+	test_when_finished "git checkout -- ambiguous_branch_and_file" &&
+	echo "file contents" >ambiguous_branch_and_file &&
+	cp ambiguous_branch_and_file expect &&
+
+	test_must_fail git checkout ambiguous_branch_and_file 2>err &&
+
+	test_i18ngrep "matched multiple (2) remote tracking branches" err &&
+
+	# file must not be altered
+	test_cmp expect ambiguous_branch_and_file
 '
 
 test_expect_success 'checkout of branch from multiple remotes fails with advice' '
@@ -276,6 +300,37 @@ test_expect_success 'loosely defined local base branch is reported correctly' '
 	status_uno_is_clean &&
 
 	test_cmp expect actual
+'
+
+test_expect_success 'reject when arg could be part of dwim branch' '
+	git remote add foo file://non-existent-place &&
+	git update-ref refs/remotes/foo/dwim-arg HEAD &&
+	echo foo >dwim-arg &&
+	git add dwim-arg &&
+	echo bar >dwim-arg &&
+	test_must_fail git checkout dwim-arg &&
+	test_must_fail git rev-parse refs/heads/dwim-arg -- &&
+	grep bar dwim-arg
+'
+
+test_expect_success 'disambiguate dwim branch and checkout path (1)' '
+	git update-ref refs/remotes/foo/dwim-arg1 HEAD &&
+	echo foo >dwim-arg1 &&
+	git add dwim-arg1 &&
+	echo bar >dwim-arg1 &&
+	git checkout -- dwim-arg1 &&
+	test_must_fail git rev-parse refs/heads/dwim-arg1 -- &&
+	grep foo dwim-arg1
+'
+
+test_expect_success 'disambiguate dwim branch and checkout path (2)' '
+	git update-ref refs/remotes/foo/dwim-arg2 HEAD &&
+	echo foo >dwim-arg2 &&
+	git add dwim-arg2 &&
+	echo bar >dwim-arg2 &&
+	git checkout dwim-arg2 -- &&
+	git rev-parse refs/heads/dwim-arg2 -- &&
+	grep bar dwim-arg2
 '
 
 test_done

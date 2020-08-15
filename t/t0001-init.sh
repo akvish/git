@@ -93,6 +93,7 @@ test_expect_success 'No extra GIT_* on alias scripts' '
 		sed -n \
 			-e "/^GIT_PREFIX=/d" \
 			-e "/^GIT_TEXTDOMAINDIR=/d" \
+			-e "/^GIT_TRACE2_PARENT/d" \
 			-e "/^GIT_/s/=.*//p" |
 		sort
 	EOF
@@ -174,7 +175,7 @@ test_expect_success 'reinit' '
 test_expect_success 'init with --template' '
 	mkdir template-source &&
 	echo content >template-source/file &&
-	git init --template=../template-source template-custom &&
+	git init --template=template-source template-custom &&
 	test_cmp template-source/file template-custom/.git/file
 '
 
@@ -310,8 +311,8 @@ test_expect_success 'init prefers command line to GIT_DIR' '
 test_expect_success 'init with separate gitdir' '
 	rm -rf newdir &&
 	git init --separate-git-dir realgitdir newdir &&
-	echo "gitdir: $(pwd)/realgitdir" >expected &&
-	test_cmp expected newdir/.git &&
+	newdir_git="$(cat newdir/.git)" &&
+	test_cmp_fspath "$(pwd)/realgitdir" "${newdir_git#gitdir: }" &&
 	test_path_is_dir realgitdir/refs
 '
 
@@ -319,14 +320,14 @@ test_lazy_prereq GETCWD_IGNORES_PERMS '
 	base=GETCWD_TEST_BASE_DIR &&
 	mkdir -p $base/dir &&
 	chmod 100 $base ||
-	error "bug in test script: cannot prepare $base"
+	BUG "cannot prepare $base"
 
 	(cd $base/dir && /bin/pwd -P)
 	status=$?
 
 	chmod 700 $base &&
 	rm -rf $base ||
-	error "bug in test script: cannot clean $base"
+	BUG "cannot clean $base"
 	return $status
 '
 
@@ -360,12 +361,9 @@ test_expect_success 're-init on .git file' '
 '
 
 test_expect_success 're-init to update git link' '
-	(
-	cd newdir &&
-	git init --separate-git-dir ../surrealgitdir
-	) &&
-	echo "gitdir: $(pwd)/surrealgitdir" >expected &&
-	test_cmp expected newdir/.git &&
+	git -C newdir init --separate-git-dir ../surrealgitdir &&
+	newdir_git="$(cat newdir/.git)" &&
+	test_cmp_fspath "$(pwd)/surrealgitdir" "${newdir_git#gitdir: }" &&
 	test_path_is_dir surrealgitdir/refs &&
 	test_path_is_missing realgitdir/refs
 '
@@ -373,12 +371,9 @@ test_expect_success 're-init to update git link' '
 test_expect_success 're-init to move gitdir' '
 	rm -rf newdir realgitdir surrealgitdir &&
 	git init newdir &&
-	(
-	cd newdir &&
-	git init --separate-git-dir ../realgitdir
-	) &&
-	echo "gitdir: $(pwd)/realgitdir" >expected &&
-	test_cmp expected newdir/.git &&
+	git -C newdir init --separate-git-dir ../realgitdir &&
+	newdir_git="$(cat newdir/.git)" &&
+	test_cmp_fspath "$(pwd)/realgitdir" "${newdir_git#gitdir: }" &&
 	test_path_is_dir realgitdir/refs
 '
 
@@ -397,13 +392,6 @@ test_expect_success SYMLINKS 're-init to move gitdir symlink' '
 	test_path_is_dir realgitdir/refs
 '
 
-# Tests for the hidden file attribute on windows
-is_hidden () {
-	# Use the output of `attrib`, ignore the absolute path
-	case "$(attrib "$1")" in *H*?:*) return 0;; esac
-	return 1
-}
-
 test_expect_success MINGW '.git hidden' '
 	rm -rf newdir &&
 	(
@@ -411,7 +399,7 @@ test_expect_success MINGW '.git hidden' '
 		mkdir newdir &&
 		cd newdir &&
 		git init &&
-		is_hidden .git
+		test_path_is_hidden .git
 	) &&
 	check_config newdir/.git false unset
 '
@@ -453,6 +441,50 @@ test_expect_success 're-init from a linked worktree' '
 	)
 '
 
+test_expect_success 'init honors GIT_DEFAULT_HASH' '
+	GIT_DEFAULT_HASH=sha1 git init sha1 &&
+	git -C sha1 rev-parse --show-object-format >actual &&
+	echo sha1 >expected &&
+	test_cmp expected actual &&
+	GIT_DEFAULT_HASH=sha256 git init sha256 &&
+	git -C sha256 rev-parse --show-object-format >actual &&
+	echo sha256 >expected &&
+	test_cmp expected actual
+'
+
+test_expect_success 'init honors --object-format' '
+	git init --object-format=sha1 explicit-sha1 &&
+	git -C explicit-sha1 rev-parse --show-object-format >actual &&
+	echo sha1 >expected &&
+	test_cmp expected actual &&
+	git init --object-format=sha256 explicit-sha256 &&
+	git -C explicit-sha256 rev-parse --show-object-format >actual &&
+	echo sha256 >expected &&
+	test_cmp expected actual
+'
+
+test_expect_success 'extensions.objectFormat is not allowed with repo version 0' '
+	git init --object-format=sha256 explicit-v0 &&
+	git -C explicit-v0 config core.repositoryformatversion 0 &&
+	test_must_fail git -C explicit-v0 rev-parse --show-object-format
+'
+
+test_expect_success 'init rejects attempts to initialize with different hash' '
+	test_must_fail git -C sha1 init --object-format=sha256 &&
+	test_must_fail git -C sha256 init --object-format=sha1
+'
+
+test_expect_success MINGW 'core.hidedotfiles = false' '
+	git config --global core.hidedotfiles false &&
+	rm -rf newdir &&
+	mkdir newdir &&
+	(
+		sane_unset GIT_DIR GIT_WORK_TREE GIT_CONFIG &&
+		git -C newdir init
+	) &&
+	! is_hidden newdir/.git
+'
+
 test_expect_success MINGW 'redirect std handles' '
 	GIT_REDIRECT_STDOUT=output.txt git rev-parse --git-dir &&
 	test .git = "$(cat output.txt)" &&
@@ -461,8 +493,34 @@ test_expect_success MINGW 'redirect std handles' '
 		GIT_REDIRECT_STDOUT=output.txt \
 		GIT_REDIRECT_STDERR="2>&1" \
 		git rev-parse --git-dir --verify refs/invalid &&
-	printf ".git\nfatal: Needed a single revision\n" >expect &&
-	test_cmp expect output.txt
+	grep "^\\.git\$" output.txt &&
+	grep "Needed a single revision" output.txt
+'
+
+test_expect_success '--initial-branch' '
+	git init --initial-branch=hello initial-branch-option &&
+	git -C initial-branch-option symbolic-ref HEAD >actual &&
+	echo refs/heads/hello >expect &&
+	test_cmp expect actual &&
+
+	: re-initializing should not change the branch name &&
+	git init --initial-branch=ignore initial-branch-option 2>err &&
+	test_i18ngrep "ignored --initial-branch" err &&
+	git -C initial-branch-option symbolic-ref HEAD >actual &&
+	grep hello actual
+'
+
+test_expect_success 'overridden default initial branch name (config)' '
+	test_config_global init.defaultBranch nmb &&
+	git init initial-branch-config &&
+	git -C initial-branch-config symbolic-ref HEAD >actual &&
+	grep nmb actual
+'
+
+test_expect_success 'invalid default branch name' '
+	test_config_global init.defaultBranch "with space" &&
+	test_must_fail git init initial-branch-invalid 2>err &&
+	test_i18ngrep "invalid branch name" err
 '
 
 test_done

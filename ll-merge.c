@@ -32,6 +32,20 @@ struct ll_merge_driver {
 	char *cmdline;
 };
 
+static struct attr_check *merge_attributes;
+static struct attr_check *load_merge_attributes(void)
+{
+	if (!merge_attributes)
+		merge_attributes = attr_check_initl("merge", "conflict-marker-size", NULL);
+	return merge_attributes;
+}
+
+void reset_merge_attributes(void)
+{
+	attr_check_free(merge_attributes);
+	merge_attributes = NULL;
+}
+
 /*
  * Built-in low-levels
  */
@@ -233,7 +247,7 @@ static int read_merge_config(const char *var, const char *value, void *cb)
 {
 	struct ll_merge_driver *fn;
 	const char *key, *name;
-	int namelen;
+	size_t namelen;
 
 	if (!strcmp(var, "merge.default"))
 		return git_config_string(&default_ll_merge, var, value);
@@ -354,7 +368,7 @@ int ll_merge(mmbuffer_t *result_buf,
 	     struct index_state *istate,
 	     const struct ll_merge_options *opts)
 {
-	static struct attr_check *check;
+	struct attr_check *check = load_merge_attributes();
 	static const struct ll_merge_options default_opts;
 	const char *ll_driver_name = NULL;
 	int marker_size = DEFAULT_CONFLICT_MARKER_SIZE;
@@ -369,9 +383,6 @@ int ll_merge(mmbuffer_t *result_buf,
 		normalize_file(theirs, path, istate);
 	}
 
-	if (!check)
-		check = attr_check_initl("merge", "conflict-marker-size", NULL);
-
 	git_check_attr(istate, path, check);
 	ll_driver_name = check->items[0].value;
 	if (check->items[1].value) {
@@ -384,7 +395,9 @@ int ll_merge(mmbuffer_t *result_buf,
 	if (opts->virtual_ancestor) {
 		if (driver->recursive)
 			driver = find_ll_merge_driver(driver->recursive);
-		marker_size += 2;
+	}
+	if (opts->extra_marker_size) {
+		marker_size += opts->extra_marker_size;
 	}
 	return driver->fn(driver, result_buf, path, ancestor, ancestor_label,
 			  ours, our_label, theirs, their_label,

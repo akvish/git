@@ -18,49 +18,60 @@ struct worktree {
 	int lock_reason_valid; /* private */
 };
 
-/* Functions for acting on the information about worktrees. */
-
-#define GWT_SORT_LINKED (1 << 0) /* keeps linked worktrees sorted */
-
 /*
  * Get the worktrees.  The primary worktree will always be the first returned,
- * and linked worktrees will be pointed to by 'next' in each subsequent
- * worktree.  No specific ordering is done on the linked worktrees.
+ * and linked worktrees will follow in no particular order.
  *
  * The caller is responsible for freeing the memory from the returned
- * worktree(s).
+ * worktrees by calling free_worktrees().
  */
-extern struct worktree **get_worktrees(unsigned flags);
+struct worktree **get_worktrees(void);
 
 /*
  * Returns 1 if linked worktrees exist, 0 otherwise.
  */
-extern int submodule_uses_worktrees(const char *path);
+int submodule_uses_worktrees(const char *path);
 
 /*
  * Return git dir of the worktree. Note that the path may be relative.
  * If wt is NULL, git dir of current worktree is returned.
  */
-extern const char *get_worktree_git_dir(const struct worktree *wt);
+const char *get_worktree_git_dir(const struct worktree *wt);
 
 /*
- * Search a worktree that can be unambiguously identified by
- * "arg". "prefix" must not be NULL.
+ * Search for the worktree identified unambiguously by `arg` -- typically
+ * supplied by the user via the command-line -- which may be a pathname or some
+ * shorthand uniquely identifying a worktree, thus making it convenient for the
+ * user to specify a worktree with minimal typing. For instance, if the last
+ * component (say, "foo") of a worktree's pathname is unique among worktrees
+ * (say, "work/foo" and "work/bar"), it can be used to identify the worktree
+ * unambiguously.
+ *
+ * `prefix` should be the `prefix` handed to top-level Git commands along with
+ * `argc` and `argv`.
+ *
+ * Return the worktree identified by `arg`, or NULL if not found.
  */
-extern struct worktree *find_worktree(struct worktree **list,
-				      const char *prefix,
-				      const char *arg);
+struct worktree *find_worktree(struct worktree **list,
+			       const char *prefix,
+			       const char *arg);
+
+/*
+ * Return the worktree corresponding to `path`, or NULL if no such worktree
+ * exists.
+ */
+struct worktree *find_worktree_by_path(struct worktree **, const char *path);
 
 /*
  * Return true if the given worktree is the main one.
  */
-extern int is_main_worktree(const struct worktree *wt);
+int is_main_worktree(const struct worktree *wt);
 
 /*
  * Return the reason string if the given worktree is locked or NULL
  * otherwise.
  */
-extern const char *worktree_lock_reason(struct worktree *wt);
+const char *worktree_lock_reason(struct worktree *wt);
 
 #define WT_VALIDATE_WORKTREE_MISSING_OK (1 << 0)
 
@@ -68,28 +79,28 @@ extern const char *worktree_lock_reason(struct worktree *wt);
  * Return zero if the worktree is in good condition. Error message is
  * returned if "errmsg" is not NULL.
  */
-extern int validate_worktree(const struct worktree *wt,
-			     struct strbuf *errmsg,
-			     unsigned flags);
+int validate_worktree(const struct worktree *wt,
+		      struct strbuf *errmsg,
+		      unsigned flags);
 
 /*
  * Update worktrees/xxx/gitdir with the new path.
  */
-extern void update_worktree_location(struct worktree *wt,
-				     const char *path_);
+void update_worktree_location(struct worktree *wt,
+			      const char *path_);
 
 /*
  * Free up the memory for worktree(s)
  */
-extern void free_worktrees(struct worktree **);
+void free_worktrees(struct worktree **);
 
 /*
  * Check if a per-worktree symref points to a ref in the main worktree
  * or any linked worktree, and return the worktree that holds the ref,
  * or NULL otherwise. The result may be destroyed by the next call.
  */
-extern const struct worktree *find_shared_symref(const char *symref,
-						 const char *target);
+const struct worktree *find_shared_symref(const char *symref,
+					  const char *target);
 
 /*
  * Similar to head_ref() for all HEADs _except_ one from the current
@@ -104,8 +115,8 @@ int is_worktree_being_bisected(const struct worktree *wt, const char *target);
  * Similar to git_path() but can produce paths for a specified
  * worktree instead of current one
  */
-extern const char *worktree_git_path(const struct worktree *wt,
-				     const char *fmt, ...)
+const char *worktree_git_path(const struct worktree *wt,
+			      const char *fmt, ...)
 	__attribute__((format (printf, 2, 3)));
 
 /*

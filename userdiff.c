@@ -23,6 +23,28 @@ IPATTERN("ada",
 	 "[a-zA-Z][a-zA-Z0-9_]*"
 	 "|[-+]?[0-9][0-9#_.aAbBcCdDeEfF]*([eE][+-]?[0-9_]+)?"
 	 "|=>|\\.\\.|\\*\\*|:=|/=|>=|<=|<<|>>|<>"),
+PATTERNS("dts",
+	 "!;\n"
+	 "!=\n"
+	 /* lines beginning with a word optionally preceded by '&' or the root */
+	 "^[ \t]*((/[ \t]*\\{|&?[a-zA-Z_]).*)",
+	 /* -- */
+	 /* Property names and math operators */
+	 "[a-zA-Z0-9,._+?#-]+"
+	 "|[-+*/%&^|!~]|>>|<<|&&|\\|\\|"),
+PATTERNS("elixir",
+	 "^[ \t]*((def(macro|module|impl|protocol|p)?|test)[ \t].*)$",
+	 /* -- */
+	 /* Atoms, names, and module attributes */
+	 "[@:]?[a-zA-Z0-9@_?!]+"
+	 /* Numbers with specific base */
+	 "|[-+]?0[xob][0-9a-fA-F]+"
+	 /* Numbers */
+	 "|[-+]?[0-9][0-9_.]*([eE][-+]?[0-9_]+)?"
+	 /* Operators and atoms that represent them */
+	 "|:?(\\+\\+|--|\\.\\.|~~~|<>|\\^\\^\\^|<?\\|>|<<<?|>?>>|<<?~|~>?>|<~>|<=|>=|===?|!==?|=~|&&&?|\\|\\|\\|?|=>|<-|\\\\\\\\|->)"
+	 /* Not real operators, but should be grouped */
+	 "|:?%[A-Za-z0-9_.]\\{\\}?"),
 IPATTERN("fortran",
 	 "!^([C*]|[ \t]*!)\n"
 	 "!^[ \t]*MODULE[ \t]+PROCEDURE[ \t]\n"
@@ -57,8 +79,16 @@ PATTERNS("java",
 	 "|[-+0-9.e]+[fFlL]?|0[xXbB]?[0-9a-fA-F]+[lL]?"
 	 "|[-+*/<>%&^|=!]="
 	 "|--|\\+\\+|<<=?|>>>?=?|&&|\\|\\|"),
+PATTERNS("markdown",
+	 "^ {0,3}#{1,6}[ \t].*",
+	 "[^<>= \t]+"),
 PATTERNS("matlab",
-	 "^[[:space:]]*((classdef|function)[[:space:]].*)$|^%%[[:space:]].*$",
+	 /*
+	  * Octave pattern is mostly the same as matlab, except that '%%%' and
+	  * '##' can also be used to begin code sections, in addition to '%%'
+	  * that is understood by both.
+	  */
+	 "^[[:space:]]*((classdef|function)[[:space:]].*)$|^(%%%?|##)[[:space:]].*$",
 	 "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|[=~<>]=|\\.[*/\\^']|\\|\\||&&"),
 PATTERNS("objc",
 	 /* Negate C statements that can look like functions */
@@ -119,7 +149,7 @@ PATTERNS("php",
 	 "[a-zA-Z_][a-zA-Z0-9_]*"
 	 "|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+"
 	 "|[-+*/<>%&^|=!.]=|--|\\+\\+|<<=?|>>=?|===|&&|\\|\\||::|->"),
-PATTERNS("python", "^[ \t]*((class|def)[ \t].*)$",
+PATTERNS("python", "^[ \t]*((class|(async[ \t]+)?def)[ \t].*)$",
 	 /* -- */
 	 "[a-zA-Z_][a-zA-Z0-9_]*"
 	 "|[-+0-9.e]+[jJlL]?|0[xX]?[0-9a-fA-F]+[lL]?"
@@ -130,6 +160,12 @@ PATTERNS("ruby", "^[ \t]*((class|module|def)[ \t].*)$",
 	 "(@|@@|\\$)?[a-zA-Z_][a-zA-Z0-9_]*"
 	 "|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+|\\?(\\\\C-)?(\\\\M-)?."
 	 "|//=?|[-+*/<>%&^|=!]=|<<=?|>>=?|===|\\.{1,3}|::|[!=]~"),
+PATTERNS("rust",
+	 "^[\t ]*((pub(\\([^\\)]+\\))?[\t ]+)?((async|const|unsafe|extern([\t ]+\"[^\"]+\"))[\t ]+)?(struct|enum|union|mod|trait|fn|impl)[< \t]+[^;]*)$",
+	 /* -- */
+	 "[a-zA-Z_][a-zA-Z0-9_]*"
+	 "|[0-9][0-9_a-fA-Fiosuxz]*(\\.([0-9]*[eE][+-]?)?[0-9_fF]*)?"
+	 "|[-+*\\/<>%&^|=!:]=|<<=?|>>=?|&&|\\|\\||->|=>|\\.{2}=|\\.{3}|::"),
 PATTERNS("bibtex", "(@[a-zA-Z]{1,}[ \t]*\\{{0,1}[ \t]*[^ \t\"@',\\#}{~%]*).*$",
 	 "[={}\"]|[^={}\" \t]+"),
 PATTERNS("tex", "^(\\\\((sub)*section|chapter|part)\\*{0,1}\\{.*)$",
@@ -189,7 +225,7 @@ static struct userdiff_driver driver_false = {
 	{ NULL, 0 }
 };
 
-static struct userdiff_driver *userdiff_find_by_namelen(const char *k, int len)
+static struct userdiff_driver *userdiff_find_by_namelen(const char *k, size_t len)
 {
 	int i;
 	for (i = 0; i < ndrivers; i++) {
@@ -233,7 +269,7 @@ int userdiff_config(const char *k, const char *v)
 {
 	struct userdiff_driver *drv;
 	const char *name, *type;
-	int namelen;
+	size_t namelen;
 
 	if (parse_config_key(k, "diff", &name, &namelen, &type) || !name)
 		return 0;
@@ -265,7 +301,8 @@ int userdiff_config(const char *k, const char *v)
 	return 0;
 }
 
-struct userdiff_driver *userdiff_find_by_name(const char *name) {
+struct userdiff_driver *userdiff_find_by_name(const char *name)
+{
 	int len = strlen(name);
 	return userdiff_find_by_namelen(name, len);
 }
@@ -290,7 +327,8 @@ struct userdiff_driver *userdiff_find_by_path(struct index_state *istate,
 	return userdiff_find_by_name(check->items[0].value);
 }
 
-struct userdiff_driver *userdiff_get_textconv(struct userdiff_driver *driver)
+struct userdiff_driver *userdiff_get_textconv(struct repository *r,
+					      struct userdiff_driver *driver)
 {
 	if (!driver->textconv)
 		return NULL;
@@ -300,7 +338,7 @@ struct userdiff_driver *userdiff_get_textconv(struct userdiff_driver *driver)
 		struct strbuf name = STRBUF_INIT;
 
 		strbuf_addf(&name, "textconv/%s", driver->name);
-		notes_cache_init(c, name.buf, driver->textconv);
+		notes_cache_init(r, c, name.buf, driver->textconv);
 		driver->textconv_cache = c;
 		strbuf_release(&name);
 	}

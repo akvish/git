@@ -36,8 +36,8 @@ void init_archivers(void)
 }
 
 static void format_subst(const struct commit *commit,
-                         const char *src, size_t len,
-                         struct strbuf *buf)
+			 const char *src, size_t len,
+			 struct strbuf *buf)
 {
 	char *to_free = NULL;
 	struct strbuf fmt = STRBUF_INIT;
@@ -77,6 +77,11 @@ void *object_file_to_archive(const struct archiver_args *args,
 {
 	void *buffer;
 	const struct commit *commit = args->convert ? args->commit : NULL;
+	struct checkout_metadata meta;
+
+	init_checkout_metadata(&meta, args->refname,
+			       args->commit_oid ? args->commit_oid :
+			       (args->tree ? &args->tree->object.oid : NULL), oid);
 
 	path += args->baselen;
 	buffer = read_object_file(oid, type, sizep);
@@ -85,7 +90,7 @@ void *object_file_to_archive(const struct archiver_args *args,
 		size_t size = 0;
 
 		strbuf_attach(&buf, buffer, *sizep, *sizep + 1);
-		convert_to_working_tree(args->repo->index, path, buf.buf, buf.len, &buf);
+		convert_to_working_tree(args->repo->index, path, buf.buf, buf.len, &buf, &meta);
 		if (commit)
 			format_subst(commit, buf.buf, buf.len, &buf);
 		buffer = strbuf_detach(&buf, &size);
@@ -285,7 +290,8 @@ int write_archive_entries(struct archiver_args *args,
 		git_attr_set_direction(GIT_ATTR_INDEX);
 	}
 
-	err = read_tree_recursive(args->tree, "", 0, 0, &args->pathspec,
+	err = read_tree_recursive(args->repo, args->tree, "",
+				  0, 0, &args->pathspec,
 				  queue_or_write_archive_entry,
 				  &context);
 	if (err == READ_TREE_RECURSIVE)
@@ -346,7 +352,8 @@ static int path_exists(struct archiver_args *args, const char *path)
 	ctx.args = args;
 	parse_pathspec(&ctx.pathspec, 0, 0, "", paths);
 	ctx.pathspec.recursive = 1;
-	ret = read_tree_recursive(args->tree, "", 0, 0, &ctx.pathspec,
+	ret = read_tree_recursive(args->repo, args->tree, "",
+				  0, 0, &ctx.pathspec,
 				  reject_entry, &ctx);
 	clear_pathspec(&ctx.pathspec);
 	return ret != 0;
@@ -378,53 +385,57 @@ static void parse_treeish_arg(const char **argv,
 		int remote)
 {
 	const char *name = argv[0];
-	const unsigned char *commit_sha1;
+	const struct object_id *commit_oid;
 	time_t archive_time;
 	struct tree *tree;
 	const struct commit *commit;
 	struct object_id oid;
+	char *ref = NULL;
 
 	/* Remotes are only allowed to fetch actual refs */
 	if (remote && !remote_allow_unreachable) {
-		char *ref = NULL;
 		const char *colon = strchrnul(name, ':');
 		int refnamelen = colon - name;
 
 		if (!dwim_ref(name, refnamelen, &oid, &ref))
-			die("no such ref: %.*s", refnamelen, name);
-		free(ref);
+			die(_("no such ref: %.*s"), refnamelen, name);
+	} else {
+		dwim_ref(name, strlen(name), &oid, &ref);
 	}
 
 	if (get_oid(name, &oid))
-		die("Not a valid object name");
+		die(_("not a valid object name: %s"), name);
 
 	commit = lookup_commit_reference_gently(ar_args->repo, &oid, 1);
 	if (commit) {
-		commit_sha1 = commit->object.oid.hash;
+		commit_oid = &commit->object.oid;
 		archive_time = commit->date;
 	} else {
-		commit_sha1 = NULL;
+		commit_oid = NULL;
 		archive_time = time(NULL);
 	}
 
 	tree = parse_tree_indirect(&oid);
 	if (tree == NULL)
-		die("not a tree object");
+		die(_("not a tree object: %s"), oid_to_hex(&oid));
 
 	if (prefix) {
 		struct object_id tree_oid;
-		unsigned int mode;
+		unsigned short mode;
 		int err;
 
-		err = get_tree_entry(&tree->object.oid, prefix, &tree_oid,
+		err = get_tree_entry(ar_args->repo,
+				     &tree->object.oid,
+				     prefix, &tree_oid,
 				     &mode);
 		if (err || !S_ISDIR(mode))
-			die("current working directory is untracked");
+			die(_("current working directory is untracked"));
 
 		tree = parse_tree_indirect(&tree_oid);
 	}
+	ar_args->refname = ref;
 	ar_args->tree = tree;
-	ar_args->commit_sha1 = commit_sha1;
+	ar_args->commit_oid = commit_oid;
 	ar_args->commit = commit;
 	ar_args->time = archive_time;
 }

@@ -32,7 +32,29 @@ test_expect_success setup '
 	test_tick &&
 	git commit -m Side &&
 
-	git tag anchor
+	git tag anchor &&
+
+	cat >./custom-merge <<-\EOF &&
+	#!/bin/sh
+
+	orig="$1" ours="$2" theirs="$3" exit="$4" path=$5
+	(
+		echo "orig is $orig"
+		echo "ours is $ours"
+		echo "theirs is $theirs"
+		echo "path is $path"
+		echo "=== orig ==="
+		cat "$orig"
+		echo "=== ours ==="
+		cat "$ours"
+		echo "=== theirs ==="
+		cat "$theirs"
+	) >"$ours+"
+	cat "$ours+" >"$ours"
+	rm -f "$ours+"
+	exit "$exit"
+	EOF
+	chmod +x ./custom-merge
 '
 
 test_expect_success merge '
@@ -82,28 +104,6 @@ test_expect_success 'retry the merge with longer context' '
 	grep "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<" actual
 '
 
-cat >./custom-merge <<\EOF
-#!/bin/sh
-
-orig="$1" ours="$2" theirs="$3" exit="$4" path=$5
-(
-	echo "orig is $orig"
-	echo "ours is $ours"
-	echo "theirs is $theirs"
-	echo "path is $path"
-	echo "=== orig ==="
-	cat "$orig"
-	echo "=== ours ==="
-	cat "$ours"
-	echo "=== theirs ==="
-	cat "$theirs"
-) >"$ours+"
-cat "$ours+" >"$ours"
-rm -f "$ours+"
-exit "$exit"
-EOF
-chmod +x ./custom-merge
-
 test_expect_success 'custom merge backend' '
 
 	echo "* merge=union" >.gitattributes &&
@@ -122,7 +122,7 @@ test_expect_success 'custom merge backend' '
 	o=$(git unpack-file master^:text) &&
 	a=$(git unpack-file side^:text) &&
 	b=$(git unpack-file master:text) &&
-	sh -c "./custom-merge $o $a $b 0 'text'" &&
+	sh -c "./custom-merge $o $a $b 0 text" &&
 	sed -e 1,3d $a >check-2 &&
 	cmp check-1 check-2 &&
 	rm -f $o $a $b
@@ -149,7 +149,7 @@ test_expect_success 'custom merge backend' '
 	o=$(git unpack-file master^:text) &&
 	a=$(git unpack-file anchor:text) &&
 	b=$(git unpack-file master:text) &&
-	sh -c "./custom-merge $o $a $b 0 'text'" &&
+	sh -c "./custom-merge $o $a $b 0 text" &&
 	sed -e 1,3d $a >check-2 &&
 	cmp check-1 check-2 &&
 	sed -e 1,3d -e 4q $a >check-3 &&

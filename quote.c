@@ -1,6 +1,6 @@
 #include "cache.h"
 #include "quote.h"
-#include "argv-array.h"
+#include "strvec.h"
 
 int quote_path_fully = 1;
 
@@ -48,8 +48,14 @@ void sq_quote_buf_pretty(struct strbuf *dst, const char *src)
 	static const char ok_punct[] = "+,-./:=@_^";
 	const char *p;
 
+	/* Avoid losing a zero-length string by adding '' */
+	if (!*src) {
+		strbuf_addstr(dst, "''");
+		return;
+	}
+
 	for (p = src; *p; p++) {
-		if (!isalpha(*p) && !isdigit(*p) && !strchr(ok_punct, *p)) {
+		if (!isalnum(*p) && !strchr(ok_punct, *p)) {
 			sq_quote_buf(dst, src);
 			return;
 		}
@@ -84,12 +90,28 @@ void sq_quote_argv(struct strbuf *dst, const char **argv)
 	}
 }
 
+/*
+ * Legacy function to append each argv value, quoted as necessasry,
+ * with whitespace before each value.  This results in a leading
+ * space in the result.
+ */
 void sq_quote_argv_pretty(struct strbuf *dst, const char **argv)
+{
+	if (argv[0])
+		strbuf_addch(dst, ' ');
+	sq_append_quote_argv_pretty(dst, argv);
+}
+
+/*
+ * Append each argv value, quoted as necessary, with whitespace between them.
+ */
+void sq_append_quote_argv_pretty(struct strbuf *dst, const char **argv)
 {
 	int i;
 
 	for (i = 0; argv[i]; i++) {
-		strbuf_addch(dst, ' ');
+		if (i > 0)
+			strbuf_addch(dst, ' ');
 		sq_quote_buf_pretty(dst, argv[i]);
 	}
 }
@@ -150,7 +172,7 @@ char *sq_dequote(char *arg)
 
 static int sq_dequote_to_argv_internal(char *arg,
 				       const char ***argv, int *nr, int *alloc,
-				       struct argv_array *array)
+				       struct strvec *array)
 {
 	char *next = arg;
 
@@ -165,7 +187,7 @@ static int sq_dequote_to_argv_internal(char *arg,
 			(*argv)[(*nr)++] = dequoted;
 		}
 		if (array)
-			argv_array_push(array, dequoted);
+			strvec_push(array, dequoted);
 	} while (next);
 
 	return 0;
@@ -176,7 +198,7 @@ int sq_dequote_to_argv(char *arg, const char ***argv, int *nr, int *alloc)
 	return sq_dequote_to_argv_internal(arg, argv, nr, alloc, NULL);
 }
 
-int sq_dequote_to_argv_array(char *arg, struct argv_array *array)
+int sq_dequote_to_strvec(char *arg, struct strvec *array)
 {
 	return sq_dequote_to_argv_internal(arg, NULL, NULL, NULL, array);
 }
@@ -234,7 +256,7 @@ static size_t next_quote_pos(const char *s, ssize_t maxlen)
  *     Return value is the same as in (1).
  */
 static size_t quote_c_style_counted(const char *name, ssize_t maxlen,
-                                    struct strbuf *sb, FILE *fp, int no_dq)
+				    struct strbuf *sb, FILE *fp, int no_dq)
 {
 #undef EMIT
 #define EMIT(c)                                 \

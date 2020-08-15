@@ -9,7 +9,7 @@
 #include "string-list.h"
 #include "thread-utils.h"
 #include "sigchain.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "refs.h"
 #include "refspec.h"
 #include "transport-internal.h"
@@ -32,7 +32,18 @@ struct helper_data {
 		signed_tags : 1,
 		check_connectivity : 1,
 		no_disconnect_req : 1,
-		no_private_update : 1;
+		no_private_update : 1,
+		object_format : 1;
+
+	/*
+	 * As an optimization, the transport code may invoke fetch before
+	 * get_refs_list. If this happens, and if the transport helper doesn't
+	 * support connect or stateless_connect, we need to invoke
+	 * get_refs_list ourselves if we haven't already done so. Keep track of
+	 * whether we have invoked get_refs_list.
+	 */
+	unsigned get_refs_list_called : 1;
+
 	char *export_marks;
 	char *import_marks;
 	/* These go from remote name (as in "list") to private name */
@@ -117,15 +128,17 @@ static struct child_process *get_helper(struct transport *transport)
 	helper->in = -1;
 	helper->out = -1;
 	helper->err = 0;
-	argv_array_pushf(&helper->args, "git-remote-%s", data->name);
-	argv_array_push(&helper->args, transport->remote->name);
-	argv_array_push(&helper->args, remove_ext_force(transport->url));
+	strvec_pushf(&helper->args, "git-remote-%s", data->name);
+	strvec_push(&helper->args, transport->remote->name);
+	strvec_push(&helper->args, remove_ext_force(transport->url));
 	helper->git_cmd = 0;
 	helper->silent_exec_failure = 1;
 
 	if (have_git_dir())
-		argv_array_pushf(&helper->env_array, "%s=%s",
-				 GIT_DIR_ENVIRONMENT, get_git_dir());
+		strvec_pushf(&helper->env_array, "%s=%s",
+			     GIT_DIR_ENVIRONMENT, get_git_dir());
+
+	helper->trace2_child_class = helper->args.v[0]; /* "remote-<name>" */
 
 	code = start_command(helper);
 	if (code < 0 && errno == ENOENT)
@@ -195,6 +208,8 @@ static struct child_process *get_helper(struct transport *transport)
 			data->import_marks = xstrdup(arg);
 		} else if (starts_with(capname, "no-private-update")) {
 			data->no_private_update = 1;
+		} else if (starts_with(capname, "object-format")) {
+			data->object_format = 1;
 		} else if (mandatory) {
 			die(_("unknown mandatory capability %s; this remote "
 			      "helper probably needs newer version of Git"),
@@ -392,15 +407,17 @@ static int fetch_with_fetch(struct transport *transport,
 	sendline(data, &buf);
 
 	while (1) {
+		const char *name;
+
 		if (recvline(data, &buf))
 			exit(128);
 
-		if (starts_with(buf.buf, "lock ")) {
-			const char *name = buf.buf + 5;
-			if (transport->pack_lockfile)
+		if (skip_prefix(buf.buf, "lock ", &name)) {
+			if (transport->pack_lockfiles.nr)
 				warning(_("%s also locked %s"), data->name, name);
 			else
-				transport->pack_lockfile = xstrdup(name);
+				string_list_append(&transport->pack_lockfiles,
+						   name);
 		}
 		else if (data->check_connectivity &&
 			 data->transport_options.check_self_contained_and_connected &&
@@ -421,13 +438,14 @@ static int get_importer(struct transport *transport, struct child_process *fasti
 	struct helper_data *data = transport->data;
 	int cat_blob_fd, code;
 	child_process_init(fastimport);
-	fastimport->in = helper->out;
-	argv_array_push(&fastimport->args, "fast-import");
-	argv_array_push(&fastimport->args, debug ? "--stats" : "--quiet");
+	fastimport->in = xdup(helper->out);
+	strvec_push(&fastimport->args, "fast-import");
+	strvec_push(&fastimport->args, "--allow-unsafe-features");
+	strvec_push(&fastimport->args, debug ? "--stats" : "--quiet");
 
 	if (data->bidi_import) {
 		cat_blob_fd = xdup(helper->in);
-		argv_array_pushf(&fastimport->args, "--cat-blob-fd=%d", cat_blob_fd);
+		strvec_pushf(&fastimport->args, "--cat-blob-fd=%d", cat_blob_fd);
 	}
 	fastimport->git_cmd = 1;
 
@@ -448,17 +466,17 @@ static int get_exporter(struct transport *transport,
 	/* we need to duplicate helper->in because we want to use it after
 	 * fastexport is done with it. */
 	fastexport->out = dup(helper->in);
-	argv_array_push(&fastexport->args, "fast-export");
-	argv_array_push(&fastexport->args, "--use-done-feature");
-	argv_array_push(&fastexport->args, data->signed_tags ?
+	strvec_push(&fastexport->args, "fast-export");
+	strvec_push(&fastexport->args, "--use-done-feature");
+	strvec_push(&fastexport->args, data->signed_tags ?
 		"--signed-tags=verbatim" : "--signed-tags=warn-strip");
 	if (data->export_marks)
-		argv_array_pushf(&fastexport->args, "--export-marks=%s.tmp", data->export_marks);
+		strvec_pushf(&fastexport->args, "--export-marks=%s.tmp", data->export_marks);
 	if (data->import_marks)
-		argv_array_pushf(&fastexport->args, "--import-marks=%s", data->import_marks);
+		strvec_pushf(&fastexport->args, "--import-marks=%s", data->import_marks);
 
 	for (i = 0; i < revlist_args->nr; i++)
-		argv_array_push(&fastexport->args, revlist_args->items[i].string);
+		strvec_push(&fastexport->args, revlist_args->items[i].string);
 
 	fastexport->git_cmd = 1;
 	return start_command(fastexport);
@@ -573,7 +591,7 @@ static int run_connect(struct transport *transport, struct strbuf *cmdbuf)
 			fprintf(stderr, "Debug: Falling back to dumb "
 				"transport.\n");
 	} else {
-		die(_(_("unknown response to connect: %s")),
+		die(_("unknown response to connect: %s"),
 		    cmdbuf->buf);
 	}
 
@@ -650,16 +668,24 @@ static int connect_helper(struct transport *transport, const char *name,
 	return 0;
 }
 
+static struct ref *get_refs_list_using_list(struct transport *transport,
+					    int for_push);
+
 static int fetch(struct transport *transport,
 		 int nr_heads, struct ref **to_fetch)
 {
 	struct helper_data *data = transport->data;
 	int i, count;
 
+	get_helper(transport);
+
 	if (process_connect(transport, 0)) {
 		do_take_over(transport);
 		return transport->vtable->fetch(transport, nr_heads, to_fetch);
 	}
+
+	if (!data->get_refs_list_called)
+		get_refs_list_using_list(transport, 0);
 
 	count = 0;
 	for (i = 0; i < nr_heads; i++)
@@ -679,10 +705,11 @@ static int fetch(struct transport *transport,
 	if (data->transport_options.update_shallow)
 		set_helper_option(transport, "update-shallow", "true");
 
-	if (data->transport_options.filter_options.choice)
-		set_helper_option(
-			transport, "filter",
-			data->transport_options.filter_options.filter_spec);
+	if (data->transport_options.filter_options.choice) {
+		const char *spec = expand_list_objects_filter_spec(
+			&data->transport_options.filter_options);
+		set_helper_option(transport, "filter", spec);
+	}
 
 	if (data->transport_options.negotiation_tips)
 		warning("Ignoring --negotiation-tip because the protocol does not support it.");
@@ -833,6 +860,10 @@ static void set_common_push_options(struct transport *transport,
 			die(_("helper %s does not support --signed=if-asked"), name);
 	}
 
+	if (flags & TRANSPORT_PUSH_ATOMIC)
+		if (set_helper_option(transport, TRANS_OPT_ATOMIC, "true") != 0)
+			die(_("helper %s does not support --atomic"), name);
+
 	if (flags & TRANSPORT_PUSH_OPTIONS) {
 		struct string_list_item *item;
 		for_each_string_list_item(item, transport->push_options)
@@ -846,6 +877,7 @@ static int push_refs_with_push(struct transport *transport,
 {
 	int force_all = flags & TRANSPORT_PUSH_FORCE;
 	int mirror = flags & TRANSPORT_PUSH_MIRROR;
+	int atomic = flags & TRANSPORT_PUSH_ATOMIC;
 	struct helper_data *data = transport->data;
 	struct strbuf buf = STRBUF_INIT;
 	struct ref *ref;
@@ -865,6 +897,12 @@ static int push_refs_with_push(struct transport *transport,
 		case REF_STATUS_REJECT_NONFASTFORWARD:
 		case REF_STATUS_REJECT_STALE:
 		case REF_STATUS_REJECT_ALREADY_EXISTS:
+			if (atomic) {
+				reject_atomic_push(remote_refs, mirror);
+				string_list_clear(&cas_options, 0);
+				return 0;
+			} else
+				continue;
 		case REF_STATUS_UPTODATE:
 			continue;
 		default:
@@ -1012,7 +1050,7 @@ static int push_refs(struct transport *transport,
 	if (!remote_refs) {
 		fprintf(stderr,
 			_("No refs in common and none specified; doing nothing.\n"
-			  "Perhaps you should specify a branch such as 'master'.\n"));
+			  "Perhaps you should specify a branch.\n"));
 		return 0;
 	}
 
@@ -1026,7 +1064,8 @@ static int push_refs(struct transport *transport,
 }
 
 
-static int has_attribute(const char *attrs, const char *attr) {
+static int has_attribute(const char *attrs, const char *attr)
+{
 	int len;
 	if (!attrs)
 		return 0;
@@ -1043,7 +1082,20 @@ static int has_attribute(const char *attrs, const char *attr) {
 }
 
 static struct ref *get_refs_list(struct transport *transport, int for_push,
-				 const struct argv_array *ref_prefixes)
+				 const struct strvec *ref_prefixes)
+{
+	get_helper(transport);
+
+	if (process_connect(transport, for_push)) {
+		do_take_over(transport);
+		return transport->vtable->get_refs_list(transport, for_push, ref_prefixes);
+	}
+
+	return get_refs_list_using_list(transport, for_push);
+}
+
+static struct ref *get_refs_list_using_list(struct transport *transport,
+					    int for_push)
 {
 	struct helper_data *data = transport->data;
 	struct child_process *helper;
@@ -1052,11 +1104,13 @@ static struct ref *get_refs_list(struct transport *transport, int for_push,
 	struct ref *posn;
 	struct strbuf buf = STRBUF_INIT;
 
+	data->get_refs_list_called = 1;
 	helper = get_helper(transport);
 
-	if (process_connect(transport, for_push)) {
-		do_take_over(transport);
-		return transport->vtable->get_refs_list(transport, for_push, ref_prefixes);
+	if (data->object_format) {
+		write_str_in_full(helper->in, "option object-format\n");
+		if (recvline(data, &buf) || strcmp(buf.buf, "ok"))
+			exit(128);
 	}
 
 	if (data->push && for_push)
@@ -1071,6 +1125,17 @@ static struct ref *get_refs_list(struct transport *transport, int for_push,
 
 		if (!*buf.buf)
 			break;
+		else if (buf.buf[0] == ':') {
+			const char *value;
+			if (skip_prefix(buf.buf, ":object-format ", &value)) {
+				int algo = hash_algo_by_name(value);
+				if (algo == GIT_HASH_UNKNOWN)
+					die(_("unsupported object format '%s'"),
+					    value);
+				transport->hash_algo = &hash_algos[algo];
+			}
+			continue;
+		}
 
 		eov = strchr(buf.buf, ' ');
 		if (!eov)
@@ -1083,7 +1148,7 @@ static struct ref *get_refs_list(struct transport *transport, int for_push,
 		if (buf.buf[0] == '@')
 			(*tail)->symref = xstrdup(buf.buf + 1);
 		else if (buf.buf[0] != '?')
-			get_oid_hex(buf.buf, &(*tail)->old_oid);
+			get_oid_hex_algop(buf.buf, &(*tail)->old_oid, transport->hash_algo);
 		if (eon) {
 			if (has_attribute(eon + 1, "unchanged")) {
 				(*tail)->status |= REF_STATUS_UPTODATE;
@@ -1105,7 +1170,6 @@ static struct ref *get_refs_list(struct transport *transport, int for_push,
 }
 
 static struct transport_vtable vtable = {
-	0,
 	set_helper_option,
 	get_refs_list,
 	fetch,
@@ -1225,9 +1289,8 @@ static int udt_do_read(struct unidirectional_transfer *t)
 		return 0;	/* No space for more. */
 
 	transfer_debug("%s is readable", t->src_name);
-	bytes = read(t->src, t->buf + t->bufuse, BUFFERSIZE - t->bufuse);
-	if (bytes < 0 && errno != EWOULDBLOCK && errno != EAGAIN &&
-		errno != EINTR) {
+	bytes = xread(t->src, t->buf + t->bufuse, BUFFERSIZE - t->bufuse);
+	if (bytes < 0) {
 		error_errno(_("read(%s) failed"), t->src_name);
 		return -1;
 	} else if (bytes == 0) {
@@ -1254,7 +1317,7 @@ static int udt_do_write(struct unidirectional_transfer *t)
 
 	transfer_debug("%s is writable", t->dest_name);
 	bytes = xwrite(t->dest, t->buf, t->bufuse);
-	if (bytes < 0 && errno != EWOULDBLOCK) {
+	if (bytes < 0) {
 		error_errno(_("write(%s) failed"), t->dest_name);
 		return -1;
 	} else if (bytes > 0) {
@@ -1446,4 +1509,26 @@ int bidirectional_transfer_loop(int input, int output)
 	state.gtp.dest_name = "remote output";
 
 	return tloop_spawnwait_tasks(&state);
+}
+
+void reject_atomic_push(struct ref *remote_refs, int mirror_mode)
+{
+	struct ref *ref;
+
+	/* Mark other refs as failed */
+	for (ref = remote_refs; ref; ref = ref->next) {
+		if (!ref->peer_ref && !mirror_mode)
+			continue;
+
+		switch (ref->status) {
+		case REF_STATUS_NONE:
+		case REF_STATUS_OK:
+		case REF_STATUS_EXPECTING_REPORT:
+			ref->status = REF_STATUS_ATOMIC_PUSH_FAILED;
+			continue;
+		default:
+			break; /* do nothing */
+		}
+	}
+	return;
 }

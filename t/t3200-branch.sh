@@ -42,6 +42,10 @@ test_expect_success 'git branch a/b/c should create a branch' '
 	git branch a/b/c && test_path_is_file .git/refs/heads/a/b/c
 '
 
+test_expect_success 'git branch mb master... should create a branch' '
+	git branch mb master... && test_path_is_file .git/refs/heads/mb
+'
+
 test_expect_success 'git branch HEAD should fail' '
 	test_must_fail git branch HEAD
 '
@@ -202,18 +206,22 @@ test_expect_success 'git branch -M baz bam should succeed when baz is checked ou
 	git worktree add -f bazdir2 baz &&
 	git branch -M baz bam &&
 	test $(git -C bazdir rev-parse --abbrev-ref HEAD) = bam &&
-	test $(git -C bazdir2 rev-parse --abbrev-ref HEAD) = bam
+	test $(git -C bazdir2 rev-parse --abbrev-ref HEAD) = bam &&
+	rm -r bazdir bazdir2 &&
+	git worktree prune
 '
 
 test_expect_success 'git branch -M baz bam should succeed within a worktree in which baz is checked out' '
 	git checkout -b baz &&
-	git worktree add -f bazdir3 baz &&
+	git worktree add -f bazdir baz &&
 	(
-		cd bazdir3 &&
+		cd bazdir &&
 		git branch -M baz bam &&
 		test $(git rev-parse --abbrev-ref HEAD) = bam
 	) &&
-	test $(git rev-parse --abbrev-ref HEAD) = bam
+	test $(git rev-parse --abbrev-ref HEAD) = bam &&
+	rm -r bazdir &&
+	git worktree prune
 '
 
 test_expect_success 'git branch -M master should work when master is checked out' '
@@ -264,6 +272,30 @@ test_expect_success 'git branch --list -d t should fail' '
 	test_must_fail git rev-parse refs/heads/t
 '
 
+test_expect_success 'deleting checked-out branch from repo that is a submodule' '
+	test_when_finished "rm -rf repo1 repo2" &&
+
+	git init repo1 &&
+	git init repo1/sub &&
+	test_commit -C repo1/sub x &&
+	git -C repo1 submodule add ./sub &&
+	git -C repo1 commit -m "adding sub" &&
+
+	git clone --recurse-submodules repo1 repo2 &&
+	git -C repo2/sub checkout -b work &&
+	test_must_fail git -C repo2/sub branch -D work
+'
+
+test_expect_success 'bare main worktree has HEAD at branch deleted by secondary worktree' '
+	test_when_finished "rm -rf nonbare base secondary" &&
+
+	git init nonbare &&
+	test_commit -C nonbare x &&
+	git clone --bare nonbare bare &&
+	git -C bare worktree add --detach ../secondary master &&
+	git -C secondary branch -D master
+'
+
 test_expect_success 'git branch --list -v with --abbrev' '
 	test_when_finished "git branch -D t" &&
 	git branch t &&
@@ -291,11 +323,11 @@ test_expect_success 'git branch --list -v with --abbrev' '
 
 test_expect_success 'git branch --column' '
 	COLUMNS=81 git branch --column=column >actual &&
-	cat >expected <<\EOF &&
-  a/b/c     bam       foo       l       * master    n         o/p       r
-  abc       bar       j/k       m/m       master2   o/o       q
+	cat >expect <<\EOF &&
+  a/b/c     bam       foo       l       * master    mb        o/o       q
+  abc       bar       j/k       m/m       master2   n         o/p       r
 EOF
-	test_cmp expected actual
+	test_cmp expect actual
 '
 
 test_expect_success 'git branch --column with an extremely long branch name' '
@@ -304,7 +336,7 @@ test_expect_success 'git branch --column with an extremely long branch name' '
 	test_when_finished "git branch -d $long" &&
 	git branch $long &&
 	COLUMNS=80 git branch --column=column >actual &&
-	cat >expected <<EOF &&
+	cat >expect <<EOF &&
   a/b/c
   abc
   bam
@@ -315,6 +347,7 @@ test_expect_success 'git branch --column with an extremely long branch name' '
   m/m
 * master
   master2
+  mb
   n
   o/o
   o/p
@@ -322,7 +355,7 @@ test_expect_success 'git branch --column with an extremely long branch name' '
   r
   $long
 EOF
-	test_cmp expected actual
+	test_cmp expect actual
 '
 
 test_expect_success 'git branch with column.*' '
@@ -331,11 +364,11 @@ test_expect_success 'git branch with column.*' '
 	COLUMNS=80 git branch >actual &&
 	git config --unset column.branch &&
 	git config --unset column.ui &&
-	cat >expected <<\EOF &&
-  a/b/c   bam   foo   l   * master    n     o/p   r
-  abc     bar   j/k   m/m   master2   o/o   q
+	cat >expect <<\EOF &&
+  a/b/c   bam   foo   l   * master    mb   o/o   q
+  abc     bar   j/k   m/m   master2   n    o/p   r
 EOF
-	test_cmp expected actual
+	test_cmp expect actual
 '
 
 test_expect_success 'git branch --column -v should fail' '
@@ -346,7 +379,7 @@ test_expect_success 'git branch -v with column.ui ignored' '
 	git config column.ui column &&
 	COLUMNS=80 git branch -v | cut -c -10 | sed "s/ *$//" >actual &&
 	git config --unset column.ui &&
-	cat >expected <<\EOF &&
+	cat >expect <<\EOF &&
   a/b/c
   abc
   bam
@@ -357,18 +390,19 @@ test_expect_success 'git branch -v with column.ui ignored' '
   m/m
 * master
   master2
+  mb
   n
   o/o
   o/p
   q
   r
 EOF
-	test_cmp expected actual
+	test_cmp expect actual
 '
 
 mv .git/config .git/config-saved
 
-test_expect_success 'git branch -m q q2 without config should succeed' '
+test_expect_success SHA1 'git branch -m q q2 without config should succeed' '
 	git branch -m q q2 &&
 	git branch -m q2 q
 '
@@ -774,7 +808,9 @@ test_expect_success 'test deleting branch without config' '
 test_expect_success 'deleting currently checked out branch fails' '
 	git worktree add -b my7 my7 &&
 	test_must_fail git -C my7 branch -d my7 &&
-	test_must_fail git branch -d my7
+	test_must_fail git branch -d my7 &&
+	rm -r my7 &&
+	git worktree prune
 '
 
 test_expect_success 'test --track without .fetch entries' '
@@ -799,32 +835,42 @@ test_expect_success 'branch from tag w/--track causes failure' '
 '
 
 test_expect_success '--set-upstream-to fails on multiple branches' '
-	test_must_fail git branch --set-upstream-to master a b c
+	echo "fatal: too many arguments to set new upstream" >expect &&
+	test_must_fail git branch --set-upstream-to master a b c 2>err &&
+	test_i18ncmp expect err
 '
 
 test_expect_success '--set-upstream-to fails on detached HEAD' '
 	git checkout HEAD^{} &&
-	test_must_fail git branch --set-upstream-to master &&
-	git checkout -
+	test_when_finished git checkout - &&
+	echo "fatal: could not set upstream of HEAD to master when it does not point to any branch." >expect &&
+	test_must_fail git branch --set-upstream-to master 2>err &&
+	test_i18ncmp expect err
 '
 
 test_expect_success '--set-upstream-to fails on a missing dst branch' '
-	test_must_fail git branch --set-upstream-to master does-not-exist
+	echo "fatal: branch '"'"'does-not-exist'"'"' does not exist" >expect &&
+	test_must_fail git branch --set-upstream-to master does-not-exist 2>err &&
+	test_i18ncmp expect err
 '
 
 test_expect_success '--set-upstream-to fails on a missing src branch' '
-	test_must_fail git branch --set-upstream-to does-not-exist master
+	test_must_fail git branch --set-upstream-to does-not-exist master 2>err &&
+	test_i18ngrep "the requested upstream branch '"'"'does-not-exist'"'"' does not exist" err
 '
 
 test_expect_success '--set-upstream-to fails on a non-ref' '
-	test_must_fail git branch --set-upstream-to HEAD^{}
+	echo "fatal: Cannot setup tracking information; starting point '"'"'HEAD^{}'"'"' is not a branch." >expect &&
+	test_must_fail git branch --set-upstream-to HEAD^{} 2>err &&
+	test_i18ncmp expect err
 '
 
 test_expect_success '--set-upstream-to fails on locked config' '
 	test_when_finished "rm -f .git/config.lock" &&
 	>.git/config.lock &&
 	git branch locked &&
-	test_must_fail git branch --set-upstream-to locked
+	test_must_fail git branch --set-upstream-to locked 2>err &&
+	test_i18ngrep "could not lock config file .git/config" err
 '
 
 test_expect_success 'use --set-upstream-to modify HEAD' '
@@ -845,14 +891,17 @@ test_expect_success 'use --set-upstream-to modify a particular branch' '
 '
 
 test_expect_success '--unset-upstream should fail if given a non-existent branch' '
-	test_must_fail git branch --unset-upstream i-dont-exist
+	echo "fatal: Branch '"'"'i-dont-exist'"'"' has no upstream information" >expect &&
+	test_must_fail git branch --unset-upstream i-dont-exist 2>err &&
+	test_i18ncmp expect err
 '
 
 test_expect_success '--unset-upstream should fail if config is locked' '
 	test_when_finished "rm -f .git/config.lock" &&
 	git branch --set-upstream-to locked &&
 	>.git/config.lock &&
-	test_must_fail git branch --unset-upstream
+	test_must_fail git branch --unset-upstream 2>err &&
+	test_i18ngrep "could not lock config file .git/config" err
 '
 
 test_expect_success 'test --unset-upstream on HEAD' '
@@ -864,17 +913,23 @@ test_expect_success 'test --unset-upstream on HEAD' '
 	test_must_fail git config branch.master.remote &&
 	test_must_fail git config branch.master.merge &&
 	# fail for a branch without upstream set
-	test_must_fail git branch --unset-upstream
+	echo "fatal: Branch '"'"'master'"'"' has no upstream information" >expect &&
+	test_must_fail git branch --unset-upstream 2>err &&
+	test_i18ncmp expect err
 '
 
 test_expect_success '--unset-upstream should fail on multiple branches' '
-	test_must_fail git branch --unset-upstream a b c
+	echo "fatal: too many arguments to unset upstream" >expect &&
+	test_must_fail git branch --unset-upstream a b c 2>err &&
+	test_i18ncmp expect err
 '
 
 test_expect_success '--unset-upstream should fail on detached HEAD' '
 	git checkout HEAD^{} &&
-	test_must_fail git branch --unset-upstream &&
-	git checkout -
+	test_when_finished git checkout - &&
+	echo "fatal: could not unset upstream of HEAD when it does not point to any branch." >expect &&
+	test_must_fail git branch --unset-upstream 2>err &&
+	test_i18ncmp expect err
 '
 
 test_expect_success 'test --unset-upstream on a particular branch' '
@@ -886,17 +941,17 @@ test_expect_success 'test --unset-upstream on a particular branch' '
 '
 
 test_expect_success 'disabled option --set-upstream fails' '
-    test_must_fail git branch --set-upstream origin/master
+	test_must_fail git branch --set-upstream origin/master
 '
 
 test_expect_success '--set-upstream-to notices an error to set branch as own upstream' '
 	git branch --set-upstream-to refs/heads/my13 my13 2>actual &&
-	cat >expected <<-\EOF &&
+	cat >expect <<-\EOF &&
 	warning: Not setting branch my13 as its own upstream.
 	EOF
 	test_expect_code 1 git config branch.my13.remote &&
 	test_expect_code 1 git config branch.my13.merge &&
-	test_i18ncmp expected actual
+	test_i18ncmp expect actual
 '
 
 # Keep this test last, as it changes the current branch

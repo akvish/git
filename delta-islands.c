@@ -17,12 +17,12 @@
 #include "pack-bitmap.h"
 #include "pack-objects.h"
 #include "delta-islands.h"
-#include "sha1-array.h"
+#include "oid-array.h"
 #include "config.h"
 
 KHASH_INIT(str, const char *, void *, 1, kh_str_hash_func, kh_str_hash_equal)
 
-static khash_sha1 *island_marks;
+static kh_oid_map_t *island_marks;
 static unsigned island_counter;
 static unsigned island_counter_core;
 
@@ -105,7 +105,7 @@ int in_same_island(const struct object_id *trg_oid, const struct object_id *src_
 	 * If we don't have a bitmap for the target, we can delta it
 	 * against anything -- it's not an important object
 	 */
-	trg_pos = kh_get_sha1(island_marks, trg_oid->hash);
+	trg_pos = kh_get_oid_map(island_marks, *trg_oid);
 	if (trg_pos >= kh_end(island_marks))
 		return 1;
 
@@ -113,7 +113,7 @@ int in_same_island(const struct object_id *trg_oid, const struct object_id *src_
 	 * if the source (our delta base) doesn't have a bitmap,
 	 * we don't want to base any deltas on it!
 	 */
-	src_pos = kh_get_sha1(island_marks, src_oid->hash);
+	src_pos = kh_get_oid_map(island_marks, *src_oid);
 	if (src_pos >= kh_end(island_marks))
 		return 0;
 
@@ -129,11 +129,11 @@ int island_delta_cmp(const struct object_id *a, const struct object_id *b)
 	if (!island_marks)
 		return 0;
 
-	a_pos = kh_get_sha1(island_marks, a->hash);
+	a_pos = kh_get_oid_map(island_marks, *a);
 	if (a_pos < kh_end(island_marks))
 		a_bitmap = kh_value(island_marks, a_pos);
 
-	b_pos = kh_get_sha1(island_marks, b->hash);
+	b_pos = kh_get_oid_map(island_marks, *b);
 	if (b_pos < kh_end(island_marks))
 		b_bitmap = kh_value(island_marks, b_pos);
 
@@ -154,7 +154,7 @@ static struct island_bitmap *create_or_get_island_marks(struct object *obj)
 	khiter_t pos;
 	int hash_ret;
 
-	pos = kh_put_sha1(island_marks, obj->oid.hash, &hash_ret);
+	pos = kh_put_oid_map(island_marks, obj->oid, &hash_ret);
 	if (hash_ret)
 		kh_value(island_marks, pos) = island_bitmap_new(NULL);
 
@@ -167,7 +167,7 @@ static void set_island_marks(struct object *obj, struct island_bitmap *marks)
 	khiter_t pos;
 	int hash_ret;
 
-	pos = kh_put_sha1(island_marks, obj->oid.hash, &hash_ret);
+	pos = kh_put_oid_map(island_marks, obj->oid, &hash_ret);
 	if (hash_ret) {
 		/*
 		 * We don't have one yet; make a copy-on-write of the
@@ -190,13 +190,15 @@ static void set_island_marks(struct object *obj, struct island_bitmap *marks)
 	island_bitmap_or(b, marks);
 }
 
-static void mark_remote_island_1(struct remote_island *rl, int is_core_island)
+static void mark_remote_island_1(struct repository *r,
+				 struct remote_island *rl,
+				 int is_core_island)
 {
 	uint32_t i;
 
 	for (i = 0; i < rl->oids.nr; ++i) {
 		struct island_bitmap *marks;
-		struct object *obj = parse_object(the_repository, &rl->oids.oid[i]);
+		struct object *obj = parse_object(r, &rl->oids.oid[i]);
 
 		if (!obj)
 			continue;
@@ -211,7 +213,7 @@ static void mark_remote_island_1(struct remote_island *rl, int is_core_island)
 		while (obj && obj->type == OBJ_TAG) {
 			obj = ((struct tag *)obj)->tagged;
 			if (obj) {
-				parse_object(the_repository, &obj->oid);
+				parse_object(r, &obj->oid);
 				marks = create_or_get_island_marks(obj);
 				island_bitmap_set(marks, island_counter);
 			}
@@ -237,7 +239,9 @@ static int tree_depth_compare(const void *a, const void *b)
 	return todo_a->depth - todo_b->depth;
 }
 
-void resolve_tree_islands(int progress, struct packing_data *to_pack)
+void resolve_tree_islands(struct repository *r,
+			  int progress,
+			  struct packing_data *to_pack)
 {
 	struct progress *progress_state = NULL;
 	struct tree_islands_todo *todo;
@@ -275,13 +279,13 @@ void resolve_tree_islands(int progress, struct packing_data *to_pack)
 		struct name_entry entry;
 		khiter_t pos;
 
-		pos = kh_get_sha1(island_marks, ent->idx.oid.hash);
+		pos = kh_get_oid_map(island_marks, ent->idx.oid);
 		if (pos >= kh_end(island_marks))
 			continue;
 
 		root_marks = kh_value(island_marks, pos);
 
-		tree = lookup_tree(the_repository, &ent->idx.oid);
+		tree = lookup_tree(r, &ent->idx.oid);
 		if (!tree || parse_tree(tree) < 0)
 			die(_("bad tree object %s"), oid_to_hex(&ent->idx.oid));
 
@@ -292,7 +296,7 @@ void resolve_tree_islands(int progress, struct packing_data *to_pack)
 			if (S_ISGITLINK(entry.mode))
 				continue;
 
-			obj = lookup_object(the_repository, entry.oid->hash);
+			obj = lookup_object(r, &entry.oid);
 			if (!obj)
 				continue;
 
@@ -415,7 +419,7 @@ static struct remote_island *get_core_island(void)
 	return NULL;
 }
 
-static void deduplicate_islands(void)
+static void deduplicate_islands(struct repository *r)
 {
 	struct remote_island *island, *core = NULL, **list;
 	unsigned int island_count, dst, src, ref, i = 0;
@@ -444,27 +448,28 @@ static void deduplicate_islands(void)
 	core = get_core_island();
 
 	for (i = 0; i < island_count; ++i) {
-		mark_remote_island_1(list[i], core && list[i]->hash == core->hash);
+		mark_remote_island_1(r, list[i], core && list[i]->hash == core->hash);
 	}
 
 	free(list);
 }
 
-void load_delta_islands(void)
+void load_delta_islands(struct repository *r, int progress)
 {
-	island_marks = kh_init_sha1();
+	island_marks = kh_init_oid_map();
 	remote_islands = kh_init_str();
 
 	git_config(island_config_callback, NULL);
 	for_each_ref(find_island_for_ref, NULL);
-	deduplicate_islands();
+	deduplicate_islands(r);
 
-	fprintf(stderr, _("Marked %d islands, done.\n"), island_counter);
+	if (progress)
+		fprintf(stderr, _("Marked %d islands, done.\n"), island_counter);
 }
 
 void propagate_island_marks(struct commit *commit)
 {
-	khiter_t pos = kh_get_sha1(island_marks, commit->object.oid.hash);
+	khiter_t pos = kh_get_oid_map(island_marks, commit->object.oid);
 
 	if (pos < kh_end(island_marks)) {
 		struct commit_list *p;
@@ -486,7 +491,7 @@ int compute_pack_layers(struct packing_data *to_pack)
 
 	for (i = 0; i < to_pack->nr_objects; ++i) {
 		struct object_entry *entry = &to_pack->objects[i];
-		khiter_t pos = kh_get_sha1(island_marks, entry->idx.oid.hash);
+		khiter_t pos = kh_get_oid_map(island_marks, entry->idx.oid);
 
 		oe_set_layer(to_pack, entry, 1);
 

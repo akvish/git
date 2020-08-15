@@ -12,9 +12,10 @@
 #include "quote.h"
 #include "transport.h"
 #include "version.h"
-#include "sha1-array.h"
+#include "oid-array.h"
 #include "gpg-interface.h"
 #include "cache.h"
+#include "shallow.h"
 
 int option_parse_push_signed(const struct option *opt,
 			     const char *arg, int unset)
@@ -40,7 +41,10 @@ int option_parse_push_signed(const struct option *opt,
 
 static void feed_object(const struct object_id *oid, FILE *fh, int negative)
 {
-	if (negative && !has_sha1_file(oid->hash))
+	if (negative &&
+	    !has_object_file_with_flags(oid,
+					OBJECT_INFO_SKIP_FETCH_OBJECT |
+					OBJECT_INFO_QUICK))
 		return;
 
 	if (negative)
@@ -64,20 +68,20 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *extra, struc
 	int i;
 	int rc;
 
-	argv_array_push(&po.args, "pack-objects");
-	argv_array_push(&po.args, "--all-progress-implied");
-	argv_array_push(&po.args, "--revs");
-	argv_array_push(&po.args, "--stdout");
+	strvec_push(&po.args, "pack-objects");
+	strvec_push(&po.args, "--all-progress-implied");
+	strvec_push(&po.args, "--revs");
+	strvec_push(&po.args, "--stdout");
 	if (args->use_thin_pack)
-		argv_array_push(&po.args, "--thin");
+		strvec_push(&po.args, "--thin");
 	if (args->use_ofs_delta)
-		argv_array_push(&po.args, "--delta-base-offset");
+		strvec_push(&po.args, "--delta-base-offset");
 	if (args->quiet || !args->progress)
-		argv_array_push(&po.args, "-q");
+		strvec_push(&po.args, "-q");
 	if (args->progress)
-		argv_array_push(&po.args, "--progress");
+		strvec_push(&po.args, "--progress");
 	if (is_repository_shallow(the_repository))
-		argv_array_push(&po.args, "--shallow");
+		strvec_push(&po.args, "--shallow");
 	po.in = -1;
 	po.out = args->stateless_rpc ? -1 : fd;
 	po.git_cmd = 1;
@@ -135,38 +139,36 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *extra, struc
 	return 0;
 }
 
-static int receive_unpack_status(int in)
+static int receive_unpack_status(struct packet_reader *reader)
 {
-	const char *line = packet_read_line(in, NULL);
-	if (!line)
+	if (packet_reader_read(reader) != PACKET_READ_NORMAL)
 		return error(_("unexpected flush packet while reading remote unpack status"));
-	if (!skip_prefix(line, "unpack ", &line))
-		return error(_("unable to parse remote unpack status: %s"), line);
-	if (strcmp(line, "ok"))
-		return error(_("remote unpack failed: %s"), line);
+	if (!skip_prefix(reader->line, "unpack ", &reader->line))
+		return error(_("unable to parse remote unpack status: %s"), reader->line);
+	if (strcmp(reader->line, "ok"))
+		return error(_("remote unpack failed: %s"), reader->line);
 	return 0;
 }
 
-static int receive_status(int in, struct ref *refs)
+static int receive_status(struct packet_reader *reader, struct ref *refs)
 {
 	struct ref *hint;
 	int ret;
 
 	hint = NULL;
-	ret = receive_unpack_status(in);
+	ret = receive_unpack_status(reader);
 	while (1) {
-		char *refname;
+		const char *refname;
 		char *msg;
-		char *line = packet_read_line(in, NULL);
-		if (!line)
+		if (packet_reader_read(reader) != PACKET_READ_NORMAL)
 			break;
-		if (!starts_with(line, "ok ") && !starts_with(line, "ng ")) {
-			error("invalid ref status from remote: %s", line);
+		if (!starts_with(reader->line, "ok ") && !starts_with(reader->line, "ng ")) {
+			error("invalid ref status from remote: %s", reader->line);
 			ret = -1;
 			break;
 		}
 
-		refname = line + 3;
+		refname = reader->line + 3;
 		msg = strchr(refname, ' ');
 		if (msg)
 			*msg++ = '\0';
@@ -187,12 +189,10 @@ static int receive_status(int in, struct ref *refs)
 			continue;
 		}
 
-		if (line[0] == 'o' && line[1] == 'k')
+		if (reader->line[0] == 'o' && reader->line[1] == 'k')
 			hint->status = REF_STATUS_OK;
-		else {
+		else
 			hint->status = REF_STATUS_REMOTE_REJECT;
-			ret = -1;
-		}
 		hint->remote_status = xstrdup_or_null(msg);
 		/* start our next search from the next ref */
 		hint = hint->next;
@@ -321,29 +321,6 @@ free_return:
 	return update_seen;
 }
 
-
-static int atomic_push_failure(struct send_pack_args *args,
-			       struct ref *remote_refs,
-			       struct ref *failing_ref)
-{
-	struct ref *ref;
-	/* Mark other refs as failed */
-	for (ref = remote_refs; ref; ref = ref->next) {
-		if (!ref->peer_ref && !args->send_mirror)
-			continue;
-
-		switch (ref->status) {
-		case REF_STATUS_EXPECTING_REPORT:
-			ref->status = REF_STATUS_ATOMIC_PUSH_FAILED;
-			continue;
-		default:
-			break; /* do nothing */
-		}
-	}
-	return error("atomic push failed for ref %s. status: %d\n",
-		     failing_ref->name, failing_ref->status);
-}
-
 #define NONCE_LEN_LIMIT 256
 
 static void reject_invalid_nonce(const char *nonce, int len)
@@ -386,10 +363,12 @@ int send_pack(struct send_pack_args *args,
 	int atomic_supported = 0;
 	int use_push_options = 0;
 	int push_options_supported = 0;
+	int object_format_supported = 0;
 	unsigned cmds_sent = 0;
 	int ret;
 	struct async demux;
 	const char *push_cert_nonce = NULL;
+	struct packet_reader reader;
 
 	/* Does the other end support the reporting? */
 	if (server_supports("report-status"))
@@ -411,6 +390,9 @@ int send_pack(struct send_pack_args *args,
 	if (server_supports("push-options"))
 		push_options_supported = 1;
 
+	if (!server_supports_hash(the_hash_algo->name, &object_format_supported))
+		die(_("the receiving end does not support this repository's hash algorithm"));
+
 	if (args->push_cert != SEND_PACK_PUSH_CERT_NEVER) {
 		int len;
 		push_cert_nonce = server_feature_value("push-cert", &len);
@@ -428,7 +410,7 @@ int send_pack(struct send_pack_args *args,
 
 	if (!remote_refs) {
 		fprintf(stderr, "No refs in common and none specified; doing nothing.\n"
-			"Perhaps you should specify a branch such as 'master'.\n");
+			"Perhaps you should specify a branch.\n");
 		return 0;
 	}
 	if (args->atomic && !atomic_supported)
@@ -451,6 +433,8 @@ int send_pack(struct send_pack_args *args,
 		strbuf_addstr(&cap_buf, " atomic");
 	if (use_push_options)
 		strbuf_addstr(&cap_buf, " push-options");
+	if (object_format_supported)
+		strbuf_addf(&cap_buf, " object-format=%s", the_hash_algo->name);
 	if (agent_supported)
 		strbuf_addf(&cap_buf, " agent=%s", git_user_agent_sanitized());
 
@@ -487,7 +471,10 @@ int send_pack(struct send_pack_args *args,
 			if (use_atomic) {
 				strbuf_release(&req_buf);
 				strbuf_release(&cap_buf);
-				return atomic_push_failure(args, remote_refs, ref);
+				reject_atomic_push(remote_refs, args->send_mirror);
+				error("atomic push failed for ref %s. status: %d\n",
+				      ref->name, ref->status);
+				return args->porcelain ? 0 : -1;
 			}
 			/* else fallthrough */
 		default:
@@ -559,10 +546,12 @@ int send_pack(struct send_pack_args *args,
 		in = demux.out;
 	}
 
+	packet_reader_init(&reader, in, NULL, 0,
+			   PACKET_READ_CHOMP_NEWLINE |
+			   PACKET_READ_DIE_ON_ERR_PACKET);
+
 	if (need_pack_data && cmds_sent) {
 		if (pack_objects(out, remote_refs, extra_have, args) < 0) {
-			for (ref = remote_refs; ref; ref = ref->next)
-				ref->status = REF_STATUS_NONE;
 			if (args->stateless_rpc)
 				close(out);
 			if (git_connection_is_socket(conn))
@@ -570,10 +559,12 @@ int send_pack(struct send_pack_args *args,
 
 			/*
 			 * Do not even bother with the return value; we know we
-			 * are failing, and just want the error() side effects.
+			 * are failing, and just want the error() side effects,
+			 * as well as marking refs with their remote status (if
+			 * we get one).
 			 */
 			if (status_report)
-				receive_unpack_status(in);
+				receive_status(&reader, remote_refs);
 
 			if (use_sideband) {
 				close(demux.out);
@@ -590,7 +581,7 @@ int send_pack(struct send_pack_args *args,
 		packet_flush(out);
 
 	if (status_report && cmds_sent)
-		ret = receive_status(in, remote_refs);
+		ret = receive_status(&reader, remote_refs);
 	else
 		ret = 0;
 	if (args->stateless_rpc)

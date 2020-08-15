@@ -1,5 +1,5 @@
 #include "cache.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "refs.h"
 #include "refspec.h"
 
@@ -72,7 +72,7 @@ static int parse_refspec(struct refspec_item *item, const char *refspec, int fet
 		/* LHS */
 		if (!*item->src)
 			; /* empty is ok; it means "HEAD" */
-		else if (llen == GIT_SHA1_HEXSZ && !get_oid_hex(item->src, &unused))
+		else if (llen == the_hash_algo->hexsz && !get_oid_hex(item->src, &unused))
 			item->exact_sha1 = 1; /* ok */
 		else if (!check_refname_format(item->src, flags))
 			; /* valid looking ref is ok */
@@ -202,7 +202,7 @@ int valid_fetch_refspec(const char *fetch_refspec_str)
 }
 
 void refspec_ref_prefixes(const struct refspec *rs,
-			  struct argv_array *ref_prefixes)
+			  struct strvec *ref_prefixes)
 {
 	int i;
 	for (i = 0; i < rs->nr; i++) {
@@ -221,9 +221,9 @@ void refspec_ref_prefixes(const struct refspec *rs,
 		if (prefix) {
 			if (item->pattern) {
 				const char *glob = strchr(prefix, '*');
-				argv_array_pushf(ref_prefixes, "%.*s",
-						 (int)(glob - prefix),
-						 prefix);
+				strvec_pushf(ref_prefixes, "%.*s",
+					     (int)(glob - prefix),
+					     prefix);
 			} else {
 				expand_ref_prefix(ref_prefixes, prefix);
 			}
